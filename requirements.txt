@@ -1,2 +1,4 @@
 flask==1.0.2
 python-telegram-bot
+web3==6.5.0
+requests==2.31.0
