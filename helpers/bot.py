@@ -1,112 +1,141 @@
 import logging
-import re
+import os
+import time
+from telegram import Bot, Update
+from flask import Flask, Blueprint, request, jsonify
+from telegram.ext import Dispatcher, CommandHandler
+from web3 import Web3
+import requests
 
-from telegram.ext import Dispatcher, CommandHandler, CallbackQueryHandler
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-
-buttons = [
-    [
-        InlineKeyboardButton("DEL", callback_data="DEL"),
-        InlineKeyboardButton("AC", callback_data="AC"),
-    ],
-    [
-        InlineKeyboardButton("(", callback_data="("),
-        InlineKeyboardButton(")", callback_data=")"),
-    ],
-    [
-        InlineKeyboardButton("7", callback_data="7"),
-        InlineKeyboardButton("8", callback_data="8"),
-        InlineKeyboardButton("9", callback_data="9"),
-        InlineKeyboardButton("/", callback_data="/"),
-    ],
-    [
-        InlineKeyboardButton("4", callback_data="4"),
-        InlineKeyboardButton("5", callback_data="5"),
-        InlineKeyboardButton("6", callback_data="6"),
-        InlineKeyboardButton("*", callback_data="*"),
-    ],
-    [
-        InlineKeyboardButton("1", callback_data="1"),
-        InlineKeyboardButton("2", callback_data="2"),
-        InlineKeyboardButton("3", callback_data="3"),
-        InlineKeyboardButton("-", callback_data="-"),
-    ],
-    [
-        InlineKeyboardButton(".", callback_data="."),
-        InlineKeyboardButton("0", callback_data="0"),
-        InlineKeyboardButton("=", callback_data="="),
-        InlineKeyboardButton("+", callback_data="+"),
-    ],
-]
-banner = "{:.^34}".format(" Calculator by @odbots ")
+# Set up logging
 logger = logging.getLogger(__name__)
 
+# Telegram Bot and Flask App Initialization
+app = Flask(__name__)
+api = Blueprint("serverless_handler", __name__)
+bot = Bot(os.environ["BOT_TOKEN"])
+app.config["tg_bot"] = bot
+dispatcher = Dispatcher(bot, None, workers=0)
 
+# Bitrock RPC and DEX Info
+BITROCK_RPC = "https://connect.bit-rock.io"
+FACTORY_ADDRESSES = {
+    "PopSwap": "0x195b605fa7c6f379fd27ddeec89cfae6caabfae9",
+    "RockSwap": "0x02c73ecb9b82e545e32665edc42ae903f8aa86a9",
+}
+FACTORY_ABI = [
+    "event PairCreated(address indexed token0, address indexed token1, address pair, uint)"
+]
+
+# Initialize Web3
+web3 = Web3(Web3.HTTPProvider(BITROCK_RPC))
+
+# Track known pairs
+known_pairs = set()
+
+# Start Command Handler
 def start_handler(update, context):
-    """Send a message when the command /start is issued."""
-    update.message.reply_text(
-        text=banner, reply_markup=InlineKeyboardMarkup(buttons), quote=True
-    )
+    update.message.reply_text("Monitoring new pairs on Bitrock DEXs...")
+
+dispatcher.add_handler(CommandHandler("start", start_handler))
 
 
-def calcExpression(text):
+# Function to get token symbols
+def get_token_symbol(token_address):
+    abi = ["function symbol() view returns (string)"]
+    contract = web3.eth.contract(address=Web3.toChecksumAddress(token_address), abi=abi)
     try:
-        return float(eval(text))
-    except (SyntaxError, ZeroDivisionError):
-        return ""
-    except TypeError:
-        return float(eval(text.replace('(', '*(')))
+        return contract.functions.symbol().call()
     except Exception as e:
-        logger.error(e, exc_info=True)
-        return ""
+        logger.error(f"Error fetching symbol for {token_address}: {e}")
+        return "N/A"
 
 
-def button_press(update, context):
-    """Function to handle the button press"""
-    callback_query = update.callback_query
-    callback_query.answer()
-    text = callback_query.message.text.split("\n")[0].strip().split("=")[0].strip()
-    text = '' if banner in text else text
-    data = callback_query.data
-    inpt = text + data
-    result = ''
-    if data == "=" and text:
-        result = calcExpression(text)
-        text = ""
-    elif data == "DEL" and text:
-        text = text[:-1]
-    elif data == "AC":
-        text = ""
-    else:
-        dot_dot_check = re.findall(r"(\d*\.\.|\d*\.\d+\.)", inpt)
-        opcheck = re.findall(r"([*/\+-]{2,})", inpt)
-        if not dot_dot_check and not opcheck:
-            strOperands = re.findall(r"(\.\d+|\d+\.\d+|\d+)", inpt)
-            if strOperands:
-                text += data
-                result = calcExpression(text)
-
-    text = f"{text:<50}"
-    if result:
-        if text:
-            text += f"\n{result:>50}"
-        else:
-            text = result
-    text += '\n\n' + banner
+# Function to fetch GeckoTerminal data
+def get_gecko_data(pair_address):
     try:
-        callback_query.edit_message_text(
-            text=text, reply_markup=InlineKeyboardMarkup(buttons)
+        url = f"https://api.geckoterminal.com/api/v2/networks/bitrock/pools/{pair_address}"
+        response = requests.get(url)
+        response.raise_for_status()
+        data = response.json().get("data", {}).get("attributes", {})
+        return {
+            "base_token_price_usd": data.get("base_token_price_usd"),
+            "base_token_price_native": data.get("base_token_price_native_currency"),
+            "fdv_usd": data.get("fdv_usd"),
+        }
+    except Exception as e:
+        logger.error(f"Error fetching GeckoTerminal data: {e}")
+        return {}
+
+
+# Function to handle new pairs
+def handle_new_pair(event, dex_name, chat_id):
+    token0 = event["args"]["token0"]
+    token1 = event["args"]["token1"]
+    pair_address = event["args"]["pair"]
+
+    if pair_address in known_pairs:
+        return
+    known_pairs.add(pair_address)
+
+    symbol0 = get_token_symbol(token0)
+    symbol1 = get_token_symbol(token1)
+
+    gecko_data = get_gecko_data(pair_address)
+    message = f"""
+✨ New Pair Detected on {dex_name}
+Token 1: {symbol0} ({token0})
+Token 2: {symbol1} ({token1})
+Pair Address: {pair_address}
+
+💵 Price (USD): {gecko_data.get('base_token_price_usd', 'N/A')}
+📈 Price in BROCK: {gecko_data.get('base_token_price_native', 'N/A')}
+🛍️ FDV (USD): {gecko_data.get('fdv_usd', 'N/A')}
+"""
+    bot.send_message(chat_id=chat_id, text=message)
+
+
+# Polling for events on the factories
+def monitor_factories(chat_id):
+    for dex_name, factory_address in FACTORY_ADDRESSES.items():
+        contract = web3.eth.contract(
+            address=Web3.toChecksumAddress(factory_address), abi=FACTORY_ABI
         )
-    except Exception as e:
-        logger.info(e)
-        pass
+        event_filter = contract.events.PairCreated.createFilter(fromBlock="latest")
+
+        while True:
+            for event in event_filter.get_new_entries():
+                handle_new_pair(event, dex_name, chat_id)
+            time.sleep(10)
 
 
-def get_dispatcher(bot):
-    """Create and return dispatcher instances"""
-    dispatcher = Dispatcher(bot, None, workers=0)
+# Webhook Handler
+@api.route("/", methods=["POST"])
+def webhook():
+    update_json = request.get_json()
+    logger.info(f"Received update: {update_json}")
+    update = Update.de_json(update_json, app.config["tg_bot"])
+    dispatcher.process_update(update)
+    return jsonify({"status": "ok"})
 
-    dispatcher.add_handler(CommandHandler("start", start_handler))
-    dispatcher.add_handler(CallbackQueryHandler(button_press))
 
-    return dispatcher
+@api.route("/")
+def home():
+    return "Bot is running!"
+
+
+# Flask setup
+app.register_blueprint(api, url_prefix="/api/webhook")
+
+# Start monitoring in a background thread
+import threading
+
+def start_monitoring():
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    monitor_thread = threading.Thread(target=monitor_factories, args=(chat_id,))
+    monitor_thread.start()
+
+
+if __name__ == "__main__":
+    start_monitoring()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
