@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 # Telegram Bot and Flask App Initialization
 app = Flask(__name__)
 api = Blueprint("serverless_handler", __name__)
-bot = Bot(os.environ["BOT_TOKEN"])
+bot = Bot(os.environ["7804006973:AAEbG0b-LGj2Toay58o_agO_6XTqMKOiMOA"])
 app.config["tg_bot"] = bot
 dispatcher = Dispatcher(bot, None, workers=0)
 
